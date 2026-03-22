@@ -8,7 +8,7 @@ import { createLogger } from './logger.js';
 import { initDatabase, closeDatabase } from './database.js';
 import { handleMessage } from './message-handler.js';
 import { registerSlashCommands, handleInteraction } from './slash-commands.js';
-import { reconnectTmuxSessions } from './session-manager.js';
+import { reconnectSessions } from './session-manager.js';
 
 const logger = createLogger('BOT');
 
@@ -33,8 +33,8 @@ export async function createBot(token: string): Promise<Client> {
     logger.log(`Bot logged in as ${c.user.tag}`);
     logger.log(`Connected to ${c.guilds.cache.size} guild(s)`);
 
-    // Reconnect to surviving tmux sessions from previous run
-    await reconnectTmuxSessions();
+    // Check agent server connections
+    await reconnectSessions();
 
     // Register slash commands
     await registerSlashCommands(c);

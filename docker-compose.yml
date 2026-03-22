@@ -1,18 +1,32 @@
 services:
+  claude-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude-agent
+    container_name: claude-agent
+    restart: unless-stopped
+    volumes:
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
+      - ${CLAUDE_JSON:-~/.claude.json}:/home/node/.claude.json
+    expose:
+      - "9877"
+      - "9878"
+
   claude-bot:
     build: .
     container_name: discord-claude-bot
     restart: unless-stopped
+    depends_on:
+      - claude-agent
     environment:
       - DISCORD_BOT_TOKEN=${CLAUDE_BOT_TOKEN}
       - BOT_CLI_TYPE=claude
       - DATA_DIR=/data
-      - TMUX_TMPDIR=/data/tmux
+      - CLAUDE_AGENT_URL=ws://claude-agent:9877
     volumes:
       - claude-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
-      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
-      - ${CLAUDE_JSON:-~/.claude.json}:/home/node/.claude.json
 
   codex-appserver:
     build:

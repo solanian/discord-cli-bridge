@@ -22,8 +22,6 @@ import {
 } from './database.js';
 import { getDefaultCLI } from './config.js';
 import { abortSession, isSessionActive } from './session-manager.js';
-import { tmuxListSessions, tmuxSessionExists } from './adapters/tmux-utils.js';
-import { sessionName } from './adapters/tmux-session.js';
 import { sendThreadMessage } from './discord-utils.js';
 import { startSession } from './session-manager.js';
 import type { OutputChunk } from './adapters/base.js';
@@ -471,36 +469,21 @@ function getClaudeUsage(): Promise<string> {
 }
 
 async function handleSessions(interaction: ChatInputCommandInteraction): Promise<void> {
-  const liveTmux = await tmuxListSessions('dcb-');
   const dbSessions = listSessions(undefined, 20);
 
-  if (liveTmux.length === 0 && dbSessions.length === 0) {
+  if (dbSessions.length === 0) {
     await interaction.reply({ content: 'No sessions found.', ephemeral: true });
     return;
   }
 
-  const lines: string[] = [];
-
-  if (liveTmux.length > 0) {
-    lines.push('**Live sessions:**');
-    for (let i = 0; i < liveTmux.length; i++) {
-      const threadId = liveTmux[i]!.replace('dcb-', '');
-      const db = getSession(threadId);
-      const name = db?.first_prompt?.replace(/\n/g, ' ').slice(0, 60) || '(unnamed)';
-      const dir = db?.directory?.split('/').pop() || '';
-      lines.push(`\`${i + 1}\` **${name}** · ${dir} · \`${threadId}\``);
-    }
-  }
-
-  // Ended sessions from DB
-  const endedSessions = dbSessions.filter(s => !liveTmux.includes(sessionName(s.thread_id)));
-  if (endedSessions.length > 0) {
-    lines.push('\n**Ended sessions:**');
-    for (const s of endedSessions.slice(0, 10)) {
-      const name = s.first_prompt?.replace(/\n/g, ' ').slice(0, 60) || '(unnamed)';
-      const date = s.updated_at.slice(0, 16).replace('T', ' ');
-      lines.push(`**${name}** · ${date} · \`${s.thread_id}\``);
-    }
+  const lines: string[] = ['**Recent sessions:**'];
+  for (let i = 0; i < Math.min(dbSessions.length, 15); i++) {
+    const s = dbSessions[i]!;
+    const name = s.first_prompt?.replace(/\n/g, ' ').slice(0, 60) || '(unnamed)';
+    const date = s.updated_at.slice(0, 16).replace('T', ' ');
+    const active = isSessionActive(s.thread_id);
+    const status = active ? 'live' : s.status;
+    lines.push(`\`${i + 1}\` **${name}** · ${status} · ${date} · \`${s.thread_id}\``);
   }
 
   await interaction.reply({
@@ -513,19 +496,12 @@ async function handleResume(interaction: ChatInputCommandInteraction): Promise<v
   const threadId = interaction.options.getString('thread', true);
   const prompt = interaction.options.getString('prompt', true);
 
-  // Check if tmux session is alive
-  const tmuxName = sessionName(threadId);
-  const tmuxAlive = await tmuxSessionExists(tmuxName);
-
-  if (!tmuxAlive) {
-    await interaction.reply({
-      content: `No live tmux session for thread \`${threadId}\`. The session may have ended.`,
-      ephemeral: true,
-    });
+  const session = getSession(threadId);
+  if (!session) {
+    await interaction.reply({ content: `No session found for \`${threadId}\`.`, ephemeral: true });
     return;
   }
 
-  const session = getSession(threadId);
   const channel = interaction.channel;
   if (!channel || channel.type !== ChannelType.GuildText) {
     await interaction.reply({ content: 'This command can only be used in a text channel.', ephemeral: true });
@@ -533,10 +509,10 @@ async function handleResume(interaction: ChatInputCommandInteraction): Promise<v
   }
 
   const config = getChannelConfig(channel.id);
-  const dir = config?.directory || session?.directory || '/workspace';
-  const cliType = session?.cli_type || getDefaultCLI();
+  const dir = config?.directory || session.directory;
+  const cliType = session.cli_type || getDefaultCLI();
 
-  await interaction.reply({ content: `Resuming session \`${threadId.slice(0, 12)}...\`` });
+  await interaction.reply({ content: `Resuming session...` });
   const reply = await interaction.fetchReply();
   const thread = await reply.startThread({ name: `Resume: ${prompt.slice(0, 60)}` });
 
@@ -544,13 +520,13 @@ async function handleResume(interaction: ChatInputCommandInteraction): Promise<v
   const typingInterval = setInterval(() => { thread.sendTyping().catch(() => {}); }, 7000);
   const startTime = Date.now();
 
-  // startSession will detect existing tmux session and send-keys into it
   await startSession({
-    threadId: threadId,  // Use original thread ID to find the tmux session
+    threadId: thread.id,
     channelId: channel.id,
     prompt,
     cliType: cliType as any,
     workingDirectory: dir,
+    sessionId: session.cli_session_id || undefined,
     model: config?.model || undefined,
     effort: config?.effort || undefined,
     maxBudgetUsd: config?.max_budget_usd || undefined,

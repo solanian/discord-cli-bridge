@@ -1,7 +1,6 @@
 import { createLogger } from './logger.js';
-import { TmuxCLISession, sessionName } from './adapters/tmux-session.js';
+import { ClaudeAgentSession } from './adapters/claude-agent.js';
 import { CodexAppServerSession } from './adapters/codex-appserver.js';
-import { tmuxListSessions, tmuxSessionExists, isTmuxAvailable } from './adapters/tmux-utils.js';
 import type { CLISession, OutputChunk } from './adapters/base.js';
 import type { CLIType } from './config.js';
 import {
@@ -83,30 +82,19 @@ export async function startSession(params: StartSessionParams): Promise<void> {
       await codexSession.start();
       session = codexSession;
     } else {
-      // Claude: use tmux (interactive mode with send-keys)
-      const tmuxName = sessionName(threadId);
-      const tmuxExists = await tmuxSessionExists(tmuxName);
-
-      const tmuxSession = new TmuxCLISession(threadId, cliType, {
-        prompt, workingDirectory, model, effort, maxBudgetUsd,
-      });
-      tmuxSession.onOutput(onOutput);
-      tmuxSession.onComplete((result) => {
+      // Claude: use Agent SDK via WebSocket
+      const claudeSession = new ClaudeAgentSession({ prompt, workingDirectory, model, effort, maxBudgetUsd });
+      claudeSession.onOutput(onOutput);
+      claudeSession.onComplete((result) => {
         updateSessionStatus(threadId, 'idle');
         onComplete(result);
       });
-      tmuxSession.onError((error) => {
+      claudeSession.onError((error) => {
         updateSessionStatus(threadId, 'error');
         onError(error);
       });
-
-      if (tmuxExists) {
-        await tmuxSession.reconnect();
-        await tmuxSession.send(prompt);
-      } else {
-        await tmuxSession.start();
-      }
-      session = tmuxSession;
+      await claudeSession.start();
+      session = claudeSession;
     }
 
     activeSessions.set(threadId, session);
@@ -135,16 +123,6 @@ export async function abortSession(threadId: string): Promise<boolean> {
     return true;
   }
 
-  // Try killing the tmux session directly
-  const tmuxName = sessionName(threadId);
-  if (await tmuxSessionExists(tmuxName)) {
-    const s = new TmuxCLISession(threadId, 'claude', { prompt: '', workingDirectory: '/' });
-    await s.kill();
-    activeSessions.delete(threadId);
-    updateSessionStatus(threadId, 'aborted');
-    return true;
-  }
-
   return false;
 }
 
@@ -153,38 +131,7 @@ export function isSessionActive(threadId: string): boolean {
   return session?.isRunning() || false;
 }
 
-/** Reconnect to surviving tmux sessions after bot restart */
-export async function reconnectTmuxSessions(): Promise<void> {
-  if (!await isTmuxAvailable()) {
-    logger.warn('tmux not available, skipping reconnection');
-    return;
-  }
-
-  const sessions = await tmuxListSessions(SESSION_PREFIX);
-  if (sessions.length === 0) {
-    logger.log('No existing tmux sessions to reconnect');
-    return;
-  }
-
-  logger.log(`Found ${sessions.length} existing tmux session(s) to reconnect`);
-  for (const name of sessions) {
-    const threadId = name.replace(SESSION_PREFIX, '');
-    const dbSession = getSession(threadId);
-    if (!dbSession) {
-      logger.warn(`No DB record for tmux session ${name}, skipping`);
-      continue;
-    }
-
-    try {
-      const session = new TmuxCLISession(threadId, dbSession.cli_type, {
-        prompt: '',
-        workingDirectory: dbSession.directory,
-      });
-      await session.reconnect();
-      activeSessions.set(threadId, session);
-      logger.log(`Reconnected to tmux session ${name}`);
-    } catch (error) {
-      logger.error(`Failed to reconnect to ${name}:`, error);
-    }
-  }
+/** Placeholder for session reconnection on bot restart */
+export async function reconnectSessions(): Promise<void> {
+  logger.log('Session reconnection: agent servers persist independently');
 }
