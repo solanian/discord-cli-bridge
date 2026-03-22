@@ -81,8 +81,9 @@ class ClaudeCodeSession implements CLISession {
       args.push('--model', this.options.model);
     }
 
-    // Note: permission bypass relies on ~/.claude/settings.json "defaultMode": "dontAsk"
-    // --dangerously-skip-permissions is blocked when running as root in Docker
+    // Fully autonomous: bypass all permission checks
+    // Requires non-root user in Docker (root is blocked by claude CLI)
+    args.push('--dangerously-skip-permissions');
 
     if (this.options.effort) {
       args.push('--effort', this.options.effort);

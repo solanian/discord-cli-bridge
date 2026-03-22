@@ -10,7 +10,8 @@ services:
     volumes:
       - claude-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
-      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/root/.claude
+      # Claude CLI auth → node user home (UID 1000)
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
 
   codex-bot:
     build: .
@@ -23,7 +24,8 @@ services:
     volumes:
       - codex-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
-      - ${CODEX_CONFIG_DIR:-~/.codex}:/root/.codex
+      # Codex CLI auth → node user home (UID 1000)
+      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
 
 volumes:
   claude-data:
