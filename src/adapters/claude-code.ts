@@ -8,15 +8,27 @@ interface ClaudeStreamEvent {
   type: string;
   subtype?: string;
   session_id?: string;
+  is_error?: boolean;
   message?: {
     content?: Array<{ type: string; text?: string; name?: string; input?: unknown }>;
     [key: string]: unknown;
   };
   result?: string;
   duration_ms?: number;
+  errors?: string[];
   [key: string]: unknown;
 }
 
+/**
+ * Persistent Claude Code session using bidirectional stream-json.
+ *
+ * Instead of spawning a new process per message (-p one-shot mode),
+ * this keeps a single process alive with:
+ *   --input-format stream-json --output-format stream-json
+ *
+ * User messages are sent via stdin as JSON, responses come on stdout.
+ * Context is preserved because the process stays alive.
+ */
 class ClaudeCodeSession implements CLISession {
   private process: ChildProcess | null = null;
   private running = false;
@@ -55,6 +67,10 @@ class ClaudeCodeSession implements CLISession {
 
     this.process.on('close', (code) => {
       this.running = false;
+      if (this.lineBuffer.trim()) {
+        this.parseLine(this.lineBuffer.trim());
+        this.lineBuffer = '';
+      }
       logger.log(`Process exited with code: ${code}`);
       for (const cb of this.completeCallbacks) {
         cb({ sessionId: this.sessionId, durationMs: undefined });
@@ -68,21 +84,24 @@ class ClaudeCodeSession implements CLISession {
         cb(error);
       }
     });
+
+    // Send the initial prompt via stdin
+    this.writeUserMessage(this.options.prompt);
   }
 
   private buildArgs(): string[] {
-    const args = ['-p', '--output-format', 'stream-json', '--verbose'];
-
-    if (this.options.sessionId) {
-      args.push('-r', this.options.sessionId);
-    }
+    const args = [
+      '-p',
+      '--output-format', 'stream-json',
+      '--input-format', 'stream-json',
+      '--verbose',
+    ];
 
     if (this.options.model) {
       args.push('--model', this.options.model);
     }
 
     // Fully autonomous: bypass all permission checks
-    // Requires non-root user in Docker (root is blocked by claude CLI)
     args.push('--dangerously-skip-permissions');
 
     if (this.options.effort) {
@@ -93,15 +112,36 @@ class ClaudeCodeSession implements CLISession {
       args.push('--max-budget-usd', this.options.maxBudgetUsd.toString());
     }
 
-    args.push(this.options.prompt);
-
     return args;
+  }
+
+  /**
+   * Send a user message via stdin in stream-json format.
+   */
+  private writeUserMessage(text: string): void {
+    if (!this.process?.stdin?.writable) {
+      logger.error('Cannot write: stdin not writable');
+      return;
+    }
+    const msg = JSON.stringify({ type: 'user_message', content: text });
+    this.process.stdin.write(msg + '\n');
+    logger.log(`Sent user message: ${text.slice(0, 80)}`);
+  }
+
+  /**
+   * Send a follow-up message to the running session.
+   * Context is preserved because the process stays alive.
+   */
+  async send(message: string): Promise<void> {
+    if (!this.running) {
+      throw new Error('Session is not running');
+    }
+    this.writeUserMessage(message);
   }
 
   private handleStdout(data: string): void {
     this.lineBuffer += data;
     const lines = this.lineBuffer.split('\n');
-    // Keep last incomplete line in buffer
     this.lineBuffer = lines.pop() || '';
 
     for (const line of lines) {
@@ -153,6 +193,12 @@ class ClaudeCodeSession implements CLISession {
       }
 
       case 'result': {
+        if (event.subtype === 'error_during_execution' || event.is_error) {
+          const errors = event.errors;
+          const errMsg = Array.isArray(errors) ? errors.join('; ') : (event.result || 'Unknown error');
+          this.emit({ type: 'error', content: errMsg });
+          break;
+        }
         const resultText = event.result || '';
         this.emit({
           type: 'result',
@@ -174,12 +220,6 @@ class ClaudeCodeSession implements CLISession {
     }
   }
 
-  async send(_message: string): Promise<void> {
-    // Claude Code in -p mode doesn't support follow-up messages via stdin.
-    // A new process needs to be started with --resume.
-    throw new Error('Claude Code -p mode does not support stdin follow-up. Use resume instead.');
-  }
-
   onOutput(callback: (chunk: OutputChunk) => void): void {
     this.outputCallbacks.push(callback);
   }
@@ -196,7 +236,6 @@ class ClaudeCodeSession implements CLISession {
     if (this.process && !this.process.killed) {
       logger.log('Aborting claude session');
       this.process.kill('SIGINT');
-      // Give it a moment, then force kill
       setTimeout(() => {
         if (this.process && !this.process.killed) {
           this.process.kill('SIGKILL');

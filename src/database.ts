@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `;
 
 export function initDatabase(): Database.Database {
@@ -186,6 +194,20 @@ export function listSessions(channelId?: string, limit = 20): Array<{
   return getDb().prepare(
     'SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ?'
   ).all(limit) as any[];
+}
+
+// --- Conversation history ---
+
+export function appendMessage(threadId: string, role: 'user' | 'assistant', content: string): void {
+  getDb().prepare(
+    `INSERT INTO messages (thread_id, role, content) VALUES (?, ?, ?)`
+  ).run(threadId, role, content);
+}
+
+export function getMessages(threadId: string, limit = 20): Array<{ role: string; content: string }> {
+  return getDb().prepare(
+    'SELECT role, content FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT ?'
+  ).all(threadId, limit).reverse() as any[];
 }
 
 // --- Config operations ---

@@ -1,7 +1,7 @@
 FROM node:22-bookworm
 
 # Install build tools for native modules (better-sqlite3)
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 make g++ tmux && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI and Codex CLI globally
 RUN npm install -g @anthropic-ai/claude-code @openai/codex

@@ -7,6 +7,7 @@ services:
       - DISCORD_BOT_TOKEN=${CLAUDE_BOT_TOKEN}
       - BOT_CLI_TYPE=claude
       - DATA_DIR=/data
+      - TMUX_TMPDIR=/data/tmux
     volumes:
       - claude-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
@@ -21,6 +22,7 @@ services:
       - DISCORD_BOT_TOKEN=${CODEX_BOT_TOKEN}
       - BOT_CLI_TYPE=codex
       - DATA_DIR=/data
+      - TMUX_TMPDIR=/data/tmux
     volumes:
       - codex-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace

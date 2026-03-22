@@ -1,7 +1,7 @@
 import { createLogger } from './logger.js';
-import { ClaudeCodeAdapter } from './adapters/claude-code.js';
-import { CodexAdapter } from './adapters/codex.js';
-import type { CLIAdapter, CLISession, OutputChunk } from './adapters/base.js';
+import { TmuxCLISession, sessionName } from './adapters/tmux-session.js';
+import { tmuxListSessions, tmuxSessionExists, isTmuxAvailable } from './adapters/tmux-utils.js';
+import type { CLISession, OutputChunk } from './adapters/base.js';
 import type { CLIType } from './config.js';
 import {
   createSession as dbCreateSession,
@@ -13,16 +13,9 @@ import {
 const logger = createLogger('SESSION');
 
 // Active sessions keyed by thread ID
-const activeSessions = new Map<string, CLISession>();
+const activeSessions = new Map<string, TmuxCLISession>();
 
-// Adapters keyed by CLI type
-const adapters: Record<CLIType, CLIAdapter> = {
-  claude: new ClaudeCodeAdapter(),
-  codex: new CodexAdapter(),
-};
-
-// Message queues for threads with active sessions
-const messageQueues = new Map<string, string[]>();
+const SESSION_PREFIX = 'dcb-';
 
 export interface StartSessionParams {
   threadId: string;
@@ -30,7 +23,7 @@ export interface StartSessionParams {
   prompt: string;
   cliType: CLIType;
   workingDirectory: string;
-  sessionId?: string;  // resume existing
+  sessionId?: string;
   model?: string;
   effort?: string;
   maxBudgetUsd?: number;
@@ -46,7 +39,6 @@ export async function startSession(params: StartSessionParams): Promise<void> {
     prompt,
     cliType,
     workingDirectory,
-    sessionId,
     model,
     effort,
     maxBudgetUsd,
@@ -55,40 +47,55 @@ export async function startSession(params: StartSessionParams): Promise<void> {
     onError,
   } = params;
 
-  // Check if there's already an active session for this thread
+  // If there's an active session in memory, send follow-up
   const existing = activeSessions.get(threadId);
   if (existing && existing.isRunning()) {
-    // Queue the message
-    logger.log(`Session active for ${threadId}, queuing message`);
-    const queue = messageQueues.get(threadId) || [];
-    queue.push(prompt);
-    messageQueues.set(threadId, queue);
+    logger.log(`Sending follow-up to existing session for ${threadId}`);
+    try {
+      await existing.send(prompt);
+    } catch (error) {
+      logger.error(`Failed to send follow-up:`, error);
+      activeSessions.delete(threadId);
+      // Retry as new session
+      return startSession(params);
+    }
     return;
   }
 
-  const adapter = adapters[cliType];
-  if (!adapter) {
-    onError(new Error(`Unknown CLI type: ${cliType}`));
-    return;
-  }
+  // Check if there's an orphaned tmux session (e.g. bot restarted)
+  const tmuxName = sessionName(threadId);
+  const tmuxExists = await tmuxSessionExists(tmuxName);
 
-  const isAvailable = await adapter.isAvailable();
-  if (!isAvailable) {
-    onError(new Error(`${cliType} CLI is not installed or not in PATH`));
-    return;
-  }
-
-  logger.log(`Starting ${cliType} session for thread ${threadId} in ${workingDirectory}`);
+  logger.log(`Starting ${cliType} session for thread ${threadId} (tmux exists: ${tmuxExists})`);
 
   try {
-    const session = await adapter.start({
+    const session = new TmuxCLISession(threadId, cliType, {
       prompt,
       workingDirectory,
-      sessionId,
       model,
       effort,
       maxBudgetUsd,
     });
+
+    // Wire up callbacks before start (so we don't miss events)
+    session.onOutput(onOutput);
+    session.onComplete((result) => {
+      updateSessionStatus(threadId, 'idle');
+      onComplete(result);
+    });
+    session.onError((error) => {
+      updateSessionStatus(threadId, 'error');
+      onError(error);
+    });
+
+    if (tmuxExists) {
+      // Reconnect and send the prompt
+      await session.reconnect();
+      await session.send(prompt);
+    } else {
+      // Create new tmux session
+      await session.start();
+    }
 
     activeSessions.set(threadId, session);
 
@@ -98,86 +105,35 @@ export async function startSession(params: StartSessionParams): Promise<void> {
       channelId,
       cliType,
       directory: workingDirectory,
-      cliSessionId: sessionId,
       firstPrompt: prompt,
     });
     updateSessionStatus(threadId, 'active');
-
-    session.onOutput((chunk) => {
-      onOutput(chunk);
-
-      // Update session ID when we get it from the CLI
-      const cliSid = session.getSessionId();
-      if (cliSid) {
-        updateSessionCLIId(threadId, cliSid);
-      }
-    });
-
-    session.onComplete(async (result) => {
-      activeSessions.delete(threadId);
-      updateSessionStatus(threadId, 'idle');
-
-      if (result.sessionId) {
-        updateSessionCLIId(threadId, result.sessionId);
-      }
-
-      onComplete(result);
-
-      // Process queued messages
-      await processQueue(threadId, params);
-    });
-
-    session.onError((error) => {
-      activeSessions.delete(threadId);
-      updateSessionStatus(threadId, 'error');
-      onError(error);
-    });
   } catch (error) {
     activeSessions.delete(threadId);
     onError(error instanceof Error ? error : new Error(String(error)));
   }
 }
 
-async function processQueue(threadId: string, originalParams: StartSessionParams): Promise<void> {
-  const queue = messageQueues.get(threadId);
-  if (!queue || queue.length === 0) {
-    messageQueues.delete(threadId);
-    return;
-  }
-
-  const nextPrompt = queue.shift()!;
-  if (queue.length === 0) {
-    messageQueues.delete(threadId);
-  }
-
-  // Get the stored session for resume
-  const dbSession = getSession(threadId);
-  const resumeSessionId = dbSession?.cli_session_id || undefined;
-
-  logger.log(`Processing queued message for ${threadId} (queue remaining: ${queue?.length || 0})`);
-
-  await startSession({
-    ...originalParams,
-    prompt: nextPrompt,
-    sessionId: resumeSessionId,
-  });
-}
-
 export async function abortSession(threadId: string): Promise<boolean> {
   const session = activeSessions.get(threadId);
-  if (!session) {
-    return false;
+  if (session) {
+    logger.log(`Aborting session for thread ${threadId}`);
+    await session.abort();
+    updateSessionStatus(threadId, 'aborted');
+    return true;
   }
 
-  logger.log(`Aborting session for thread ${threadId}`);
-  await session.abort();
-  activeSessions.delete(threadId);
-  updateSessionStatus(threadId, 'aborted');
+  // Try killing the tmux session directly
+  const tmuxName = sessionName(threadId);
+  if (await tmuxSessionExists(tmuxName)) {
+    const s = new TmuxCLISession(threadId, 'claude', { prompt: '', workingDirectory: '/' });
+    await s.kill();
+    activeSessions.delete(threadId);
+    updateSessionStatus(threadId, 'aborted');
+    return true;
+  }
 
-  // Clear message queue
-  messageQueues.delete(threadId);
-
-  return true;
+  return false;
 }
 
 export function isSessionActive(threadId: string): boolean {
@@ -185,10 +141,38 @@ export function isSessionActive(threadId: string): boolean {
   return session?.isRunning() || false;
 }
 
-export function getQueueLength(threadId: string): number {
-  return messageQueues.get(threadId)?.length || 0;
-}
+/** Reconnect to surviving tmux sessions after bot restart */
+export async function reconnectTmuxSessions(): Promise<void> {
+  if (!await isTmuxAvailable()) {
+    logger.warn('tmux not available, skipping reconnection');
+    return;
+  }
 
-export function getAdapter(cliType: CLIType): CLIAdapter {
-  return adapters[cliType];
+  const sessions = await tmuxListSessions(SESSION_PREFIX);
+  if (sessions.length === 0) {
+    logger.log('No existing tmux sessions to reconnect');
+    return;
+  }
+
+  logger.log(`Found ${sessions.length} existing tmux session(s) to reconnect`);
+  for (const name of sessions) {
+    const threadId = name.replace(SESSION_PREFIX, '');
+    const dbSession = getSession(threadId);
+    if (!dbSession) {
+      logger.warn(`No DB record for tmux session ${name}, skipping`);
+      continue;
+    }
+
+    try {
+      const session = new TmuxCLISession(threadId, dbSession.cli_type, {
+        prompt: '',
+        workingDirectory: dbSession.directory,
+      });
+      await session.reconnect();
+      activeSessions.set(threadId, session);
+      logger.log(`Reconnected to tmux session ${name}`);
+    } catch (error) {
+      logger.error(`Failed to reconnect to ${name}:`, error);
+    }
+  }
 }

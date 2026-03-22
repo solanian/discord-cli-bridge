@@ -8,7 +8,7 @@ import {
 } from 'discord.js';
 import { createLogger } from './logger.js';
 import { getChannelConfig, getSession } from './database.js';
-import { startSession, isSessionActive, abortSession, getQueueLength } from './session-manager.js';
+import { startSession, isSessionActive } from './session-manager.js';
 import { sendThreadMessage, formatToolUse, SILENT_FLAGS } from './discord-utils.js';
 import { getDefaultCLI } from './config.js';
 import type { OutputChunk } from './adapters/base.js';
@@ -22,11 +22,18 @@ const TEXT_DEBOUNCE_MS = 1500;
 
 function flushTextBuffer(thread: ThreadChannel, threadId: string): void {
   const buf = textBuffers.get(threadId);
-  if (!buf || !buf.text.trim()) return;
+  if (!buf) return;
+
+  // Clear any pending timer
+  if (buf.timer) {
+    clearTimeout(buf.timer);
+    buf.timer = null;
+  }
+
+  if (!buf.text.trim()) return;
 
   const text = buf.text;
   buf.text = '';
-  buf.timer = null;
 
   sendThreadMessage(thread, `▸ ${text}`).catch((err) => {
     logger.error(`Failed to send text to thread ${threadId}:`, err);
@@ -129,26 +136,22 @@ async function handleThreadMessage(message: Message, thread: ThreadChannel): Pro
   const prompt = message.content?.trim();
   if (!prompt) return;
 
-  // If session is active, queue message
-  if (isSessionActive(thread.id)) {
-    const queueLen = getQueueLength(thread.id);
-    await sendThreadMessage(thread, `Queued at position ${queueLen + 1}`);
-  }
-
   // Show typing indicator
   await thread.sendTyping();
 
   const startTime = Date.now();
 
+  // If session is already running (persistent process), send() will deliver
+  // the message via stdin. Otherwise startSession creates a new process.
   await startSession({
     threadId: thread.id,
     channelId: session.channel_id,
     prompt,
     cliType: session.cli_type,
     workingDirectory: session.directory,
-    sessionId: session.cli_session_id || undefined,
     onOutput: (chunk) => handleOutputChunk(thread, thread.id, chunk),
     onComplete: (result) => {
+      flushTextBuffer(thread, thread.id);
       const elapsed = Date.now() - startTime;
       const elapsedStr = formatDuration(elapsed);
       const footer = `${session.directory.split('/').pop()} · ${elapsedStr} · ${session.cli_type}`;
@@ -157,6 +160,7 @@ async function handleThreadMessage(message: Message, thread: ThreadChannel): Pro
       });
     },
     onError: (error) => {
+      flushTextBuffer(thread, thread.id);
       sendThreadMessage(thread, `⚠ Error: ${error.message.slice(0, 1800)}`).catch((err) => {
         logger.error(`Failed to send error:`, err);
       });
@@ -223,6 +227,7 @@ async function handleChannelMessage(message: Message, textChannel: TextChannel):
     onOutput: (chunk) => handleOutputChunk(thread, thread.id, chunk),
     onComplete: (result) => {
       clearInterval(typingInterval);
+      flushTextBuffer(thread, thread.id);
       const elapsed = Date.now() - startTime;
       const elapsedStr = formatDuration(elapsed);
       const projectName = directory.split('/').pop() || 'project';
@@ -233,6 +238,7 @@ async function handleChannelMessage(message: Message, textChannel: TextChannel):
     },
     onError: (error) => {
       clearInterval(typingInterval);
+      flushTextBuffer(thread, thread.id);
       sendThreadMessage(thread, `⚠ Error: ${error.message.slice(0, 1800)}`).catch((err) => {
         logger.error(`Failed to send error:`, err);
       });
