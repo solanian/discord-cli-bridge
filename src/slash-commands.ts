@@ -225,7 +225,7 @@ export async function handleInteraction(interaction: Interaction): Promise<void>
 
 async function handleSetProject(interaction: ChatInputCommandInteraction): Promise<void> {
   const dirPath = interaction.options.getString('path', true);
-  const cli = (interaction.options.getString('cli') || 'claude') as CLIType;
+  const cli = (interaction.options.getString('cli') || getDefaultCLI()) as CLIType;
 
   if (!fs.existsSync(dirPath)) {
     await interaction.reply({ content: `Directory does not exist: \`${dirPath}\``, ephemeral: true });

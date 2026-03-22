@@ -1,9 +1,19 @@
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('TMUX');
 
+function ensureTmuxDir(): void {
+  const tmuxDir = process.env['TMUX_TMPDIR'];
+  if (tmuxDir && !fs.existsSync(tmuxDir)) {
+    fs.mkdirSync(tmuxDir, { recursive: true });
+    logger.log(`Created TMUX_TMPDIR: ${tmuxDir}`);
+  }
+}
+
 function exec(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  ensureTmuxDir();
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { timeout: 10000 }, (error, stdout, stderr) => {
       if (error) reject(error);
@@ -58,7 +68,14 @@ export async function tmuxSendControlC(name: string): Promise<void> {
 }
 
 export async function tmuxCapturePaneAll(name: string): Promise<string> {
-  const { stdout } = await exec('tmux', ['capture-pane', '-p', '-S', '-', '-t', name]);
+  // Capture entire scrollback (-S -) and visible area (-E -)
+  // If scrollback is empty, fall back to visible pane only
+  try {
+    const { stdout } = await exec('tmux', ['capture-pane', '-p', '-S', '-', '-E', '-', '-t', name]);
+    if (stdout.trim()) return stdout;
+  } catch {}
+  // Fallback: visible pane only
+  const { stdout } = await exec('tmux', ['capture-pane', '-p', '-t', name]);
   return stdout;
 }
 

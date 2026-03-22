@@ -12,21 +12,181 @@ import {
 const logger = createLogger('TMUX-SESSION');
 const SESSION_PREFIX = 'dcb-';
 const POLL_INTERVAL_MS = 600;
-const STABLE_COMPLETE = 4;   // 2.4s stable + prompt = response done
-const STABLE_TIMEOUT = 100;  // 60s fallback
-
-// Claude interactive mode prompt
-const PROMPT_RE = /❯\s*$/;
+const STABLE_COMPLETE = 4;
+const STABLE_TIMEOUT = 100;
 
 export function sessionName(threadId: string): string {
   return `${SESSION_PREFIX}${threadId}`;
 }
 
-/**
- * Persistent tmux session running claude/codex in interactive mode.
- * The CLI process stays alive across messages — context is naturally preserved.
- * Messages are injected via tmux send-keys, output captured via capture-pane polling.
- */
+// ─── Claude TUI parsing ────────────────────────────────────────────
+
+const claudeParser = {
+  /** Claude prompt: ❯ */
+  isPromptLine(line: string): boolean {
+    return line === '❯';
+  },
+
+  /** Claude user input: ❯ followed by text */
+  isUserInput(line: string): boolean {
+    return line.startsWith('❯ ') && line.length > 2;
+  },
+
+  /** Claude idle: ❯ alone near bottom */
+  isIdlePrompt(lines: string[]): boolean {
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
+      const l = lines[i]!.trim();
+      if (!l) continue;
+      if (l === '❯') return true;
+      if (!claudeParser.isChrome(l)) return false;
+    }
+    return false;
+  },
+
+  isChrome(line: string): boolean {
+    if (!line) return true;
+    if (/^[─━╭╰│╮╯┃┣┫╌]+$/.test(line)) return true;
+    if (line.startsWith('╭') || line.startsWith('╰') || line.startsWith('│')) return true;
+    if (line.includes('bypass permissions on')) return true;
+    if (line.includes('shift+tab to cycle')) return true;
+    if (line.includes('· /effort')) return true;
+    if (line.includes('Welcome back')) return true;
+    if (line.includes('Claude Code v')) return true;
+    if (line.includes('Tips for getting')) return true;
+    if (line.includes('Recent activity')) return true;
+    if (line.includes('No recent activity')) return true;
+    if (line.includes('Claude Max')) return true;
+    if (line.includes('Opus 4')) return true;
+    if (line.includes('Sonnet')) return true;
+    if (line.includes('▐▛') || line.includes('▝▜') || line.includes('▘▘')) return true;
+    if (line.includes('/workspace/')) return true;
+    if (line.includes('installMethod')) return true;
+    if (line.includes('Claude Code has switched')) return true;
+    if (line.includes('Double-tap esc')) return true;
+    if (line.includes('ctrl+o to expand')) return true;
+    if (line.includes('Tip:')) return true;
+    if (line.includes('/permissions')) return true;
+    if (line.includes('pre-approve')) return true;
+    if (line.includes('pre-deny')) return true;
+    // Spinners: ✻ Thinking…, ✽ Creating…, * Kneading…, etc
+    if (/^[✻✽✶✢·✦✧✸*\-]\s/.test(line)) return true;
+    if (/^[✻✽✶✢·✦✧✸*\-]?\s*\w+…$/.test(line)) return true;
+    if (/^[✻✽✶✢·✦✧✸*\-]$/.test(line)) return true;
+    if (line.includes('Reading') && line.includes('file')) return true;
+    if (line.includes('Writing') && line.includes('memory')) return true;
+    if (line.startsWith('⎿') && (line.includes('Tip:') || line.includes('$'))) return true;
+    return false;
+  },
+
+  extractResponse(capture: string): string {
+    const lines = capture.split('\n');
+    let lastPromptIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const t = lines[i]!.trim();
+      if (claudeParser.isUserInput(t)) { lastPromptIdx = i; break; }
+    }
+    if (lastPromptIdx === -1) return '';
+
+    const out: string[] = [];
+    for (let i = lastPromptIdx + 1; i < lines.length; i++) {
+      const t = lines[i]!.trim();
+      if (!t) continue;
+      if (claudeParser.isPromptLine(t)) break;
+      if (claudeParser.isChrome(t)) continue;
+      out.push(t);
+    }
+    return out.join('\n').trim();
+  },
+};
+
+// ─── Codex TUI parsing ─────────────────────────────────────────────
+
+const codexParser = {
+  isPromptLine(line: string): boolean {
+    return line === '›' || line === '>';
+  },
+
+  isUserInput(line: string): boolean {
+    if (!line.startsWith('› ') || line.length <= 2) return false;
+    const text = line.slice(2);
+    // Skip Codex TUI placeholder hints
+    if (text.startsWith('Use /')) return false;
+    if (text.startsWith('Summarize ')) return false;
+    if (text.startsWith('Explain ')) return false;
+    if (text.startsWith('Fix ')) return false;
+    if (text.startsWith('Add ')) return false;
+    if (text.startsWith('Write ')) return false;
+    if (text.startsWith('Create ')) return false;
+    if (text.startsWith('Refactor ')) return false;
+    if (text.startsWith('Debug ')) return false;
+    if (text.startsWith('Review ')) return false;
+    if (text.startsWith('Test ')) return false;
+    return true;
+  },
+
+  isIdlePrompt(lines: string[]): boolean {
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
+      const l = lines[i]!.trim();
+      if (!l) continue;
+      if (l === '›' || l === '>') return true;
+      // Codex shows placeholder hints like "› Explain this codebase", "› Use /skills"
+      if (l.startsWith('›')) return true;
+      if (!codexParser.isChrome(l)) return false;
+    }
+    return false;
+  },
+
+  isChrome(line: string): boolean {
+    if (!line) return true;
+    if (/^[─━╭╰│╮╯┃┣┫╌]+$/.test(line)) return true;
+    if (line.startsWith('╭') || line.startsWith('╰') || line.startsWith('│')) return true;
+    if (line.includes('OpenAI Codex')) return true;
+    if (line.includes('/model to change')) return true;
+    if (line.includes('left ·')) return true;
+    if (line.includes('directory:')) return true;
+    if (line.includes('model:')) return true;
+    if (line.includes('bubblewrap')) return true;
+    if (line.includes('bwrap')) return true;
+    if (line.includes('composer is empty')) return true;
+    if (line.includes('New 2x rate')) return true;
+    if (line.includes('Summarize recent')) return true;
+    if (line.startsWith('› Use /')) return true;
+    if (line.startsWith('› Summarize')) return true;
+    if (line.includes('press Esc to step back')) return true;
+    if (line.includes('Enter confirms')) return true;
+    // Codex spinners
+    if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(line)) return true;
+    // Working/thinking indicators: • Working (0s • esc to interrupt)
+    if (line.includes('esc to interrupt')) return true;
+    if (/^[•◦]\s*Working/.test(line)) return true;
+    if (/^[•◦]\s*Thinking/.test(line)) return true;
+    return false;
+  },
+
+  extractResponse(capture: string): string {
+    const lines = capture.split('\n');
+    let lastPromptIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const t = lines[i]!.trim();
+      if (codexParser.isUserInput(t)) { lastPromptIdx = i; break; }
+    }
+    if (lastPromptIdx === -1) return '';
+
+    const out: string[] = [];
+    for (let i = lastPromptIdx + 1; i < lines.length; i++) {
+      const t = lines[i]!.trim();
+      if (!t) continue;
+      // Any › line after response = idle prompt or placeholder hint = stop
+      if (t.startsWith('›') || t === '>') break;
+      if (codexParser.isChrome(t)) continue;
+      out.push(t);
+    }
+    return out.join('\n').trim();
+  },
+};
+
+// ─── TmuxCLISession ────────────────────────────────────────────────
+
 export class TmuxCLISession implements CLISession {
   private name: string;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -40,6 +200,7 @@ export class TmuxCLISession implements CLISession {
   private startTime = 0;
   private emittedContent = '';
   private waitingForResponse = false;
+  private parser: typeof claudeParser | typeof codexParser;
 
   constructor(
     private threadId: string,
@@ -48,12 +209,11 @@ export class TmuxCLISession implements CLISession {
   ) {
     this.name = sessionName(threadId);
     this.sessionId = threadId;
+    this.parser = cliType === 'claude' ? claudeParser : codexParser;
   }
 
-  /** Create a new tmux session with the CLI, run onboarding, then send prompt */
   async start(): Promise<void> {
     const exists = await tmuxSessionExists(this.name);
-
     if (exists) {
       logger.log(`Reusing existing tmux session: ${this.name}`);
       this.running = true;
@@ -66,16 +226,13 @@ export class TmuxCLISession implements CLISession {
     await tmuxCreateSession(this.name, cmd, this.options.workingDirectory);
     this.running = true;
 
-    // Wait for CLI to start and skip onboarding screens
     await this.waitForPrompt();
 
-    // Send initial prompt
     if (this.options.prompt) {
       await this.sendMessage(this.options.prompt);
     }
   }
 
-  /** Reconnect to an existing tmux session (after bot restart) */
   async reconnect(): Promise<void> {
     if (!await tmuxSessionExists(this.name)) {
       throw new Error(`tmux session ${this.name} does not exist`);
@@ -84,16 +241,12 @@ export class TmuxCLISession implements CLISession {
     this.running = true;
   }
 
-  /** Send a follow-up message — context preserved because process is alive */
   async send(message: string): Promise<void> {
     if (!this.running) throw new Error('Session not running');
-
-    // If tmux session died, throw so session-manager can recreate
     if (!await tmuxSessionExists(this.name)) {
       this.running = false;
       throw new Error('tmux session no longer exists');
     }
-
     await this.sendMessage(message);
   }
 
@@ -104,25 +257,24 @@ export class TmuxCLISession implements CLISession {
       if (this.options.effort) parts.push('--effort', this.options.effort);
       return parts.join(' ');
     } else {
-      const parts = ['codex', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'];
+      const parts = ['codex', '--dangerously-bypass-approvals-and-sandbox'];
       if (this.options.model) parts.push('-m', this.options.model);
       return parts.join(' ');
     }
   }
 
-  /** Skip setup screens (trust folder, etc.) by pressing Enter until we see the ❯ prompt */
   private async waitForPrompt(): Promise<void> {
     logger.log(`Waiting for prompt in ${this.name}...`);
     for (let i = 0; i < 10; i++) {
       await sleep(1500);
       const capture = await tmuxCapturePaneAll(this.name).catch(() => '');
+      const lines = capture.split('\n');
 
-      if (PROMPT_RE.test(capture.trim())) {
+      if (this.parser.isIdlePrompt(lines)) {
         logger.log(`Prompt ready in ${this.name}`);
         return;
       }
 
-      // Press Enter to skip trust/setup screens
       await tmuxSendKeys(this.name, '');
       logger.log(`Sent Enter to skip setup (attempt ${i + 1})`);
     }
@@ -131,18 +283,20 @@ export class TmuxCLISession implements CLISession {
 
   private async sendMessage(text: string): Promise<void> {
     logger.log(`Sending to ${this.name}: ${text.slice(0, 100)}`);
-
-    // Capture baseline before sending
     this.lastCapture = await tmuxCapturePaneAll(this.name).catch(() => '');
-    this.emittedContent = this.lastCapture;
+    this.emittedContent = '';
     this.stableCount = 0;
     this.startTime = Date.now();
     this.waitingForResponse = true;
 
-    // Send via tmux send-keys
     await tmuxSendKeys(this.name, text);
 
-    // Start polling for response
+    // Codex requires a second Enter to submit the message
+    if (this.cliType === 'codex') {
+      await sleep(300);
+      await tmuxSendKeys(this.name, '');
+    }
+
     this.startPolling();
   }
 
@@ -152,10 +306,7 @@ export class TmuxCLISession implements CLISession {
   }
 
   private stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
   }
 
   private async poll(): Promise<void> {
@@ -171,15 +322,16 @@ export class TmuxCLISession implements CLISession {
 
       if (capture === this.lastCapture) {
         this.stableCount++;
-
         if (this.waitingForResponse && this.stableCount >= STABLE_COMPLETE) {
-          // Check if CLI is back at prompt (response finished)
-          if (this.isAtPrompt(capture)) {
-            this.finishResponse(capture);
-            return;
+          if (this.parser.isIdlePrompt(capture.split('\n'))) {
+            // Only finish if there's actually a response to show
+            const response = this.parser.extractResponse(capture);
+            if (response) {
+              this.finishResponse(capture);
+              return;
+            }
           }
         }
-
         if (this.waitingForResponse && this.stableCount >= STABLE_TIMEOUT) {
           logger.warn(`Timeout for ${this.name}`);
           this.finishResponse(capture);
@@ -188,11 +340,9 @@ export class TmuxCLISession implements CLISession {
         return;
       }
 
-      // New content
       this.stableCount = 0;
       this.lastCapture = capture;
 
-      // Extract and emit new content
       const newContent = this.extractNewContent(capture);
       if (newContent) {
         this.emit({ type: 'text', content: newContent });
@@ -202,64 +352,25 @@ export class TmuxCLISession implements CLISession {
     }
   }
 
-  private isAtPrompt(capture: string): boolean {
-    const trimmed = capture.trim();
-    // Last line should be the prompt character
-    const lastLine = trimmed.split('\n').pop()?.trim() || '';
-    return PROMPT_RE.test(lastLine) || lastLine === '❯' || lastLine === '>';
-  }
-
   private extractNewContent(capture: string): string {
-    if (!this.emittedContent) {
-      this.emittedContent = capture;
-      return '';
+    const response = this.parser.extractResponse(capture);
+    if (!response) return '';
+    if (response === this.emittedContent) return '';
+
+    if (this.emittedContent && response.startsWith(this.emittedContent)) {
+      const newPart = response.slice(this.emittedContent.length).trim();
+      this.emittedContent = response;
+      return newPart;
     }
 
-    // Find new content by comparing with what we already emitted
-    if (capture.length > this.emittedContent.length &&
-        capture.startsWith(this.emittedContent.slice(0, 200))) {
-      const raw = capture.slice(this.emittedContent.length);
-      this.emittedContent = capture;
-      return this.cleanForDiscord(raw);
-    }
-
-    // Content changed significantly (scroll/redraw)
-    // Compare line by line from the end
-    const oldLines = this.emittedContent.split('\n');
-    const newLines = capture.split('\n');
-
-    if (newLines.length > oldLines.length) {
-      const diff = newLines.slice(oldLines.length);
-      this.emittedContent = capture;
-      return this.cleanForDiscord(diff.join('\n'));
-    }
-
-    this.emittedContent = capture;
-    return '';
-  }
-
-  private cleanForDiscord(raw: string): string {
-    return raw
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => {
-        if (!l) return false;
-        if (PROMPT_RE.test(l) || l === '❯' || l === '>') return false;
-        // Filter TUI chrome
-        if (/^[─━╭╰│╮╯┃┣┫]+$/.test(l)) return false;
-        if (l.includes('bypass permissions on')) return false;
-        if (l.includes('shift+tab to cycle')) return false;
-        return true;
-      })
-      .join('\n')
-      .trim();
+    this.emittedContent = response;
+    return response;
   }
 
   private finishResponse(capture: string): void {
     this.stopPolling();
     this.waitingForResponse = false;
 
-    // Emit any remaining content
     const finalContent = this.extractNewContent(capture);
     if (finalContent) {
       this.emit({ type: 'text', content: finalContent });
@@ -271,33 +382,22 @@ export class TmuxCLISession implements CLISession {
     for (const cb of this.completeCallbacks) {
       cb({ sessionId: this.sessionId, durationMs: elapsed });
     }
-    // Session stays alive for next message
   }
 
   private emit(chunk: OutputChunk): void {
     for (const cb of this.outputCallbacks) cb(chunk);
   }
 
-  onOutput(callback: (chunk: OutputChunk) => void): void {
-    this.outputCallbacks.push(callback);
-  }
+  onOutput(callback: (chunk: OutputChunk) => void): void { this.outputCallbacks.push(callback); }
+  onComplete(callback: (result: { sessionId?: string; durationMs?: number }) => void): void { this.completeCallbacks.push(callback); }
+  onError(callback: (error: Error) => void): void { this.errorCallbacks.push(callback); }
 
-  onComplete(callback: (result: { sessionId?: string; durationMs?: number }) => void): void {
-    this.completeCallbacks.push(callback);
-  }
-
-  onError(callback: (error: Error) => void): void {
-    this.errorCallbacks.push(callback);
-  }
-
-  /** Interrupt current operation (Ctrl-C), but keep session alive */
   async abort(): Promise<void> {
     this.stopPolling();
     this.waitingForResponse = false;
     await tmuxSendControlC(this.name);
   }
 
-  /** Kill the tmux session entirely */
   async kill(): Promise<void> {
     this.stopPolling();
     this.running = false;
@@ -305,13 +405,8 @@ export class TmuxCLISession implements CLISession {
     await tmuxKillSession(this.name);
   }
 
-  isRunning(): boolean {
-    return this.running;
-  }
-
-  getSessionId(): string | undefined {
-    return this.sessionId;
-  }
+  isRunning(): boolean { return this.running; }
+  getSessionId(): string | undefined { return this.sessionId; }
 }
 
 function sleep(ms: number): Promise<void> {
