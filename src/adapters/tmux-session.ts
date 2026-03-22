@@ -110,11 +110,11 @@ export class TmuxCLISession implements CLISession {
     }
   }
 
-  /** Skip onboarding screens by pressing Enter until we see the ❯ prompt */
+  /** Skip setup screens (trust folder, etc.) by pressing Enter until we see the ❯ prompt */
   private async waitForPrompt(): Promise<void> {
     logger.log(`Waiting for prompt in ${this.name}...`);
-    for (let i = 0; i < 20; i++) {
-      await sleep(2000);
+    for (let i = 0; i < 10; i++) {
+      await sleep(1500);
       const capture = await tmuxCapturePaneAll(this.name).catch(() => '');
 
       if (PROMPT_RE.test(capture.trim())) {
@@ -122,11 +122,11 @@ export class TmuxCLISession implements CLISession {
         return;
       }
 
-      // Press Enter to skip onboarding screens
-      await tmuxSendKeys(this.name, '');  // just Enter
-      logger.log(`Sent Enter to skip onboarding (attempt ${i + 1})`);
+      // Press Enter to skip trust/setup screens
+      await tmuxSendKeys(this.name, '');
+      logger.log(`Sent Enter to skip setup (attempt ${i + 1})`);
     }
-    logger.warn(`Prompt not detected after 40s for ${this.name}, proceeding anyway`);
+    logger.warn(`Prompt not detected after 15s for ${this.name}, proceeding anyway`);
   }
 
   private async sendMessage(text: string): Promise<void> {
