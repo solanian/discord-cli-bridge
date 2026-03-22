@@ -471,7 +471,6 @@ function getClaudeUsage(): Promise<string> {
 }
 
 async function handleSessions(interaction: ChatInputCommandInteraction): Promise<void> {
-  // Show live tmux sessions + DB records
   const liveTmux = await tmuxListSessions('dcb-');
   const dbSessions = listSessions(undefined, 20);
 
@@ -482,27 +481,25 @@ async function handleSessions(interaction: ChatInputCommandInteraction): Promise
 
   const lines: string[] = [];
 
-  // Live tmux sessions
   if (liveTmux.length > 0) {
-    lines.push('**Live sessions (tmux running):**');
-    for (const name of liveTmux) {
-      const threadId = name.replace('dcb-', '');
+    lines.push('**Live sessions:**');
+    for (let i = 0; i < liveTmux.length; i++) {
+      const threadId = liveTmux[i]!.replace('dcb-', '');
       const db = getSession(threadId);
-      const dir = db?.directory?.split('/').pop() || '?';
-      const prompt = db?.first_prompt?.replace(/\n/g, ' ').slice(0, 50) || '';
-      lines.push(`\`${threadId}\` · ${dir} · ${prompt}`);
+      const name = db?.first_prompt?.replace(/\n/g, ' ').slice(0, 60) || '(unnamed)';
+      const dir = db?.directory?.split('/').pop() || '';
+      lines.push(`\`${i + 1}\` **${name}** · ${dir} · \`${threadId}\``);
     }
   }
 
-  // Recent DB sessions (may or may not have tmux alive)
-  if (dbSessions.length > 0) {
-    lines.push('\n**Recent sessions (DB):**');
-    for (const s of dbSessions.slice(0, 10)) {
-      const alive = liveTmux.includes(sessionName(s.thread_id));
-      const status = alive ? 'live' : s.status;
+  // Ended sessions from DB
+  const endedSessions = dbSessions.filter(s => !liveTmux.includes(sessionName(s.thread_id)));
+  if (endedSessions.length > 0) {
+    lines.push('\n**Ended sessions:**');
+    for (const s of endedSessions.slice(0, 10)) {
+      const name = s.first_prompt?.replace(/\n/g, ' ').slice(0, 60) || '(unnamed)';
       const date = s.updated_at.slice(0, 16).replace('T', ' ');
-      const prompt = s.first_prompt?.replace(/\n/g, ' ').slice(0, 40) || '';
-      lines.push(`\`${s.thread_id}\` ${status} · ${date} · ${prompt}`);
+      lines.push(`**${name}** · ${date} · \`${s.thread_id}\``);
     }
   }
 
