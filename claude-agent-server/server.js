@@ -69,7 +69,7 @@ wss.on('connection', (ws) => {
 
               switch (event.type) {
                 case 'system': {
-                  sessionId = event.sessionId;
+                  sessionId = event.session_id;
                   sessions.set(threadId, sessionId);
                   ws.send(JSON.stringify({
                     method: 'session/started',
@@ -99,14 +99,17 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'result': {
+                  // Prefer session_id from result event
+                  const finalSessionId = event.session_id || sessionId;
+                  if (finalSessionId) sessions.set(threadId, finalSessionId);
                   ws.send(JSON.stringify({
                     method: 'session/completed',
                     params: {
                       threadId,
-                      sessionId,
+                      sessionId: finalSessionId,
                       result: event.result,
-                      durationMs: event.durationMs,
-                      cost: event.totalCostUsd,
+                      durationMs: event.duration_ms,
+                      cost: event.total_cost_usd,
                     },
                   }));
                   break;
