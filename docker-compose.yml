@@ -1,0 +1,30 @@
+services:
+  claude-bot:
+    build: .
+    container_name: discord-claude-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${CLAUDE_BOT_TOKEN}
+      - BOT_CLI_TYPE=claude
+      - DATA_DIR=/data
+    volumes:
+      - claude-data:/data
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CLAUDE_CONFIG_DIR:-~/.claude}:/root/.claude
+
+  codex-bot:
+    build: .
+    container_name: discord-codex-bot
+    restart: unless-stopped
+    environment:
+      - DISCORD_BOT_TOKEN=${CODEX_BOT_TOKEN}
+      - BOT_CLI_TYPE=codex
+      - DATA_DIR=/data
+    volumes:
+      - codex-data:/data
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CODEX_CONFIG_DIR:-~/.codex}:/root/.codex
+
+volumes:
+  claude-data:
+  codex-data:

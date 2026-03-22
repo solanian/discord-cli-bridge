@@ -1,0 +1,6 @@
+node_modules/
+dist/
+kimaki-original/
+*.db
+*.log
+.env
