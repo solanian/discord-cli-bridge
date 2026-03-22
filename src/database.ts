@@ -196,7 +196,7 @@ export function listSessions(channelId?: string, limit = 20): Array<{
   ).all(limit) as any[];
 }
 
-// --- Conversation history ---
+// --- Conversation history (kept for backwards compat, no longer primary) ---
 
 export function appendMessage(threadId: string, role: 'user' | 'assistant', content: string): void {
   getDb().prepare(

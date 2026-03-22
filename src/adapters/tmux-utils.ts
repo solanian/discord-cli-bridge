@@ -45,8 +45,10 @@ export async function tmuxCreateSession(name: string, cmd: string, cwd: string):
 }
 
 export async function tmuxSendKeys(name: string, text: string): Promise<void> {
-  // Use -l (literal) to avoid key name interpretation
-  await exec('tmux', ['send-keys', '-t', name, '-l', text]);
+  if (text) {
+    // Use -l (literal) to avoid key name interpretation
+    await exec('tmux', ['send-keys', '-t', name, '-l', text]);
+  }
   // Press Enter
   await exec('tmux', ['send-keys', '-t', name, 'Enter']);
 }

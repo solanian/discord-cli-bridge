@@ -3,27 +3,29 @@ import type { CLISession, SessionOptions, OutputChunk } from './base.js';
 import {
   tmuxSessionExists,
   tmuxCreateSession,
+  tmuxSendKeys,
+  tmuxSendControlC,
   tmuxCapturePaneAll,
   tmuxKillSession,
 } from './tmux-utils.js';
-import {
-  appendMessage,
-  getMessages,
-} from '../database.js';
 
 const logger = createLogger('TMUX-SESSION');
 const SESSION_PREFIX = 'dcb-';
+const POLL_INTERVAL_MS = 600;
+const STABLE_COMPLETE = 4;   // 2.4s stable + prompt = response done
+const STABLE_TIMEOUT = 100;  // 60s fallback
+
+// Claude interactive mode prompt
+const PROMPT_RE = /❯\s*$/;
 
 export function sessionName(threadId: string): string {
   return `${SESSION_PREFIX}${threadId}`;
 }
 
 /**
- * Hybrid approach: uses `claude -p` (one-shot) for reliability,
- * but stores conversation history in DB and includes it in each prompt.
- *
- * tmux is used to run the subprocess so it survives bot restarts.
- * The capture-pane polling detects when the response is complete.
+ * Persistent tmux session running claude/codex in interactive mode.
+ * The CLI process stays alive across messages — context is naturally preserved.
+ * Messages are injected via tmux send-keys, output captured via capture-pane polling.
  */
 export class TmuxCLISession implements CLISession {
   private name: string;
@@ -37,6 +39,7 @@ export class TmuxCLISession implements CLISession {
   private errorCallbacks: Array<(error: Error) => void> = [];
   private startTime = 0;
   private emittedContent = '';
+  private waitingForResponse = false;
 
   constructor(
     private threadId: string,
@@ -47,93 +50,105 @@ export class TmuxCLISession implements CLISession {
     this.sessionId = threadId;
   }
 
+  /** Create a new tmux session with the CLI, run onboarding, then send prompt */
   async start(): Promise<void> {
-    await this.runPrompt(this.options.prompt);
-  }
+    const exists = await tmuxSessionExists(this.name);
 
-  async reconnect(): Promise<void> {
-    // For DB-based history, reconnect just means we're ready
-    this.running = true;
-    logger.log(`Session ${this.name} ready for reconnect`);
-  }
-
-  async send(message: string): Promise<void> {
-    await this.runPrompt(message);
-  }
-
-  private async runPrompt(userMessage: string): Promise<void> {
-    // Kill any existing tmux session for this thread
-    if (await tmuxSessionExists(this.name)) {
-      await tmuxKillSession(this.name);
-      await sleep(500);
+    if (exists) {
+      logger.log(`Reusing existing tmux session: ${this.name}`);
+      this.running = true;
+      await this.sendMessage(this.options.prompt);
+      return;
     }
 
-    // Build prompt with conversation history
-    const history = getMessages(this.threadId, 30);
-    let fullPrompt: string;
-
-    if (history.length > 0) {
-      const historyText = history.map(m =>
-        `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`
-      ).join('\n\n');
-      fullPrompt = `Here is our conversation so far:\n\n${historyText}\n\nUser: ${userMessage}\n\nContinue the conversation. Respond to the latest user message.`;
-    } else {
-      fullPrompt = userMessage;
-    }
-
-    // Save user message to DB
-    appendMessage(this.threadId, 'user', userMessage);
-
-    // Build CLI command
-    const cmd = this.buildCommand(fullPrompt);
-    logger.log(`Running in tmux ${this.name}: ${cmd.slice(0, 120)}...`);
-
-    this.startTime = Date.now();
-    this.emittedContent = '';
-    this.stableCount = 0;
-    this.running = true;
-
-    // Create tmux session running claude -p
+    const cmd = this.buildCommand();
+    logger.log(`Creating tmux session: ${this.name} → ${cmd}`);
     await tmuxCreateSession(this.name, cmd, this.options.workingDirectory);
+    this.running = true;
 
-    // Start polling for output
-    await sleep(1000);
-    this.lastCapture = await tmuxCapturePaneAll(this.name).catch(() => '');
-    this.startPolling();
+    // Wait for CLI to start and skip onboarding screens
+    await this.waitForPrompt();
+
+    // Send initial prompt
+    if (this.options.prompt) {
+      await this.sendMessage(this.options.prompt);
+    }
   }
 
-  private buildCommand(prompt: string): string {
-    // Escape the prompt for shell
-    const escaped = prompt.replace(/'/g, "'\\''");
+  /** Reconnect to an existing tmux session (after bot restart) */
+  async reconnect(): Promise<void> {
+    if (!await tmuxSessionExists(this.name)) {
+      throw new Error(`tmux session ${this.name} does not exist`);
+    }
+    logger.log(`Reconnected to tmux session: ${this.name}`);
+    this.running = true;
+  }
 
+  /** Send a follow-up message — context preserved because process is alive */
+  async send(message: string): Promise<void> {
+    if (!this.running) throw new Error('Session not running');
+
+    // If tmux session died, throw so session-manager can recreate
+    if (!await tmuxSessionExists(this.name)) {
+      this.running = false;
+      throw new Error('tmux session no longer exists');
+    }
+
+    await this.sendMessage(message);
+  }
+
+  private buildCommand(): string {
     if (this.cliType === 'claude') {
-      const parts = [
-        'claude', '-p',
-        '--output-format', 'text',
-        '--dangerously-skip-permissions',
-      ];
+      const parts = ['claude', '--dangerously-skip-permissions'];
       if (this.options.model) parts.push('--model', this.options.model);
       if (this.options.effort) parts.push('--effort', this.options.effort);
-      if (this.options.maxBudgetUsd) parts.push('--max-budget-usd', String(this.options.maxBudgetUsd));
-      parts.push(`'${escaped}'`);
-      // Keep the session alive after command finishes so we can capture output
-      return `${parts.join(' ')}; echo "___DCB_DONE___"; sleep 86400`;
+      return parts.join(' ');
     } else {
-      const parts = [
-        'codex', 'exec',
-        '--dangerously-bypass-approvals-and-sandbox',
-        '--skip-git-repo-check',
-      ];
+      const parts = ['codex', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check'];
       if (this.options.model) parts.push('-m', this.options.model);
-      if (this.options.effort) parts.push('-c', `model_reasoning_effort="${this.options.effort}"`);
-      parts.push(`'${escaped}'`);
-      return `${parts.join(' ')}; echo "___DCB_DONE___"; sleep 86400`;
+      return parts.join(' ');
     }
+  }
+
+  /** Skip onboarding screens by pressing Enter until we see the ❯ prompt */
+  private async waitForPrompt(): Promise<void> {
+    logger.log(`Waiting for prompt in ${this.name}...`);
+    for (let i = 0; i < 20; i++) {
+      await sleep(2000);
+      const capture = await tmuxCapturePaneAll(this.name).catch(() => '');
+
+      if (PROMPT_RE.test(capture.trim())) {
+        logger.log(`Prompt ready in ${this.name}`);
+        return;
+      }
+
+      // Press Enter to skip onboarding screens
+      await tmuxSendKeys(this.name, '');  // just Enter
+      logger.log(`Sent Enter to skip onboarding (attempt ${i + 1})`);
+    }
+    logger.warn(`Prompt not detected after 40s for ${this.name}, proceeding anyway`);
+  }
+
+  private async sendMessage(text: string): Promise<void> {
+    logger.log(`Sending to ${this.name}: ${text.slice(0, 100)}`);
+
+    // Capture baseline before sending
+    this.lastCapture = await tmuxCapturePaneAll(this.name).catch(() => '');
+    this.emittedContent = this.lastCapture;
+    this.stableCount = 0;
+    this.startTime = Date.now();
+    this.waitingForResponse = true;
+
+    // Send via tmux send-keys
+    await tmuxSendKeys(this.name, text);
+
+    // Start polling for response
+    this.startPolling();
   }
 
   private startPolling(): void {
     if (this.pollTimer) clearInterval(this.pollTimer);
-    this.pollTimer = setInterval(() => this.poll(), 800);
+    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
   }
 
   private stopPolling(): void {
@@ -145,17 +160,27 @@ export class TmuxCLISession implements CLISession {
 
   private async poll(): Promise<void> {
     try {
+      if (!await tmuxSessionExists(this.name)) {
+        this.running = false;
+        this.stopPolling();
+        for (const cb of this.errorCallbacks) cb(new Error('tmux session terminated'));
+        return;
+      }
+
       const capture = await tmuxCapturePaneAll(this.name);
 
       if (capture === this.lastCapture) {
         this.stableCount++;
-        // If stable and we see our done marker, response is complete
-        if (this.stableCount >= 3 && capture.includes('___DCB_DONE___')) {
-          this.finishResponse(capture);
-          return;
+
+        if (this.waitingForResponse && this.stableCount >= STABLE_COMPLETE) {
+          // Check if CLI is back at prompt (response finished)
+          if (this.isAtPrompt(capture)) {
+            this.finishResponse(capture);
+            return;
+          }
         }
-        // Timeout fallback (60 seconds of no change)
-        if (this.stableCount >= 75) {
+
+        if (this.waitingForResponse && this.stableCount >= STABLE_TIMEOUT) {
           logger.warn(`Timeout for ${this.name}`);
           this.finishResponse(capture);
           return;
@@ -163,67 +188,82 @@ export class TmuxCLISession implements CLISession {
         return;
       }
 
-      // Content changed
+      // New content
       this.stableCount = 0;
+      this.lastCapture = capture;
 
-      // Check for done marker
-      if (capture.includes('___DCB_DONE___')) {
-        // Wait a bit for final content
-        this.lastCapture = capture;
-        return; // Will be caught by stability check above
-      }
-
-      // Emit new content
+      // Extract and emit new content
       const newContent = this.extractNewContent(capture);
       if (newContent) {
         this.emit({ type: 'text', content: newContent });
       }
-
-      this.lastCapture = capture;
     } catch (error) {
       logger.error(`Poll error for ${this.name}:`, error);
     }
   }
 
+  private isAtPrompt(capture: string): boolean {
+    const trimmed = capture.trim();
+    // Last line should be the prompt character
+    const lastLine = trimmed.split('\n').pop()?.trim() || '';
+    return PROMPT_RE.test(lastLine) || lastLine === '❯' || lastLine === '>';
+  }
+
   private extractNewContent(capture: string): string {
-    // Remove the done marker and everything after
-    const clean = (capture.split('___DCB_DONE___')[0] || capture).trim();
-
-    if (!clean) return '';
-
-    // If we have previous emitted content, only return what's new
-    if (this.emittedContent) {
-      if (clean.length > this.emittedContent.length) {
-        const newPart = clean.slice(this.emittedContent.length).trim();
-        this.emittedContent = clean;
-        return newPart;
-      }
-      // Content same or shorter (redraw) - nothing new
+    if (!this.emittedContent) {
+      this.emittedContent = capture;
       return '';
     }
 
-    // First time - emit everything
-    this.emittedContent = clean;
-    return clean;
+    // Find new content by comparing with what we already emitted
+    if (capture.length > this.emittedContent.length &&
+        capture.startsWith(this.emittedContent.slice(0, 200))) {
+      const raw = capture.slice(this.emittedContent.length);
+      this.emittedContent = capture;
+      return this.cleanForDiscord(raw);
+    }
+
+    // Content changed significantly (scroll/redraw)
+    // Compare line by line from the end
+    const oldLines = this.emittedContent.split('\n');
+    const newLines = capture.split('\n');
+
+    if (newLines.length > oldLines.length) {
+      const diff = newLines.slice(oldLines.length);
+      this.emittedContent = capture;
+      return this.cleanForDiscord(diff.join('\n'));
+    }
+
+    this.emittedContent = capture;
+    return '';
+  }
+
+  private cleanForDiscord(raw: string): string {
+    return raw
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => {
+        if (!l) return false;
+        if (PROMPT_RE.test(l) || l === '❯' || l === '>') return false;
+        // Filter TUI chrome
+        if (/^[─━╭╰│╮╯┃┣┫]+$/.test(l)) return false;
+        if (l.includes('bypass permissions on')) return false;
+        if (l.includes('shift+tab to cycle')) return false;
+        return true;
+      })
+      .join('\n')
+      .trim();
   }
 
   private finishResponse(capture: string): void {
     this.stopPolling();
+    this.waitingForResponse = false;
 
-    // Extract final response
+    // Emit any remaining content
     const finalContent = this.extractNewContent(capture);
     if (finalContent) {
       this.emit({ type: 'text', content: finalContent });
     }
-
-    // Save full response to DB
-    const fullResponse = (capture.split('___DCB_DONE___')[0] || '').trim();
-    if (fullResponse) {
-      appendMessage(this.threadId, 'assistant', fullResponse);
-    }
-
-    // Kill the tmux session (it was just sleeping)
-    tmuxKillSession(this.name).catch(() => {});
 
     const elapsed = Date.now() - this.startTime;
     logger.log(`Response complete for ${this.name} (${elapsed}ms)`);
@@ -231,6 +271,7 @@ export class TmuxCLISession implements CLISession {
     for (const cb of this.completeCallbacks) {
       cb({ sessionId: this.sessionId, durationMs: elapsed });
     }
+    // Session stays alive for next message
   }
 
   private emit(chunk: OutputChunk): void {
@@ -249,14 +290,19 @@ export class TmuxCLISession implements CLISession {
     this.errorCallbacks.push(callback);
   }
 
+  /** Interrupt current operation (Ctrl-C), but keep session alive */
   async abort(): Promise<void> {
     this.stopPolling();
-    await tmuxKillSession(this.name).catch(() => {});
+    this.waitingForResponse = false;
+    await tmuxSendControlC(this.name);
   }
 
+  /** Kill the tmux session entirely */
   async kill(): Promise<void> {
-    await this.abort();
+    this.stopPolling();
     this.running = false;
+    this.waitingForResponse = false;
+    await tmuxKillSession(this.name);
   }
 
   isRunning(): boolean {
