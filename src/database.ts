@@ -163,6 +163,7 @@ export function getSession(threadId: string): {
   cli_type: CLIType;
   directory: string;
   status: string;
+  first_prompt: string | null;
 } | undefined {
   return getDb().prepare('SELECT * FROM sessions WHERE thread_id = ?').get(threadId) as any;
 }
