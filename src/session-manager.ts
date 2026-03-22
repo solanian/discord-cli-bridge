@@ -1,5 +1,6 @@
 import { createLogger } from './logger.js';
 import { TmuxCLISession, sessionName } from './adapters/tmux-session.js';
+import { CodexAppServerSession } from './adapters/codex-appserver.js';
 import { tmuxListSessions, tmuxSessionExists, isTmuxAvailable } from './adapters/tmux-utils.js';
 import type { CLISession, OutputChunk } from './adapters/base.js';
 import type { CLIType } from './config.js';
@@ -13,7 +14,7 @@ import {
 const logger = createLogger('SESSION');
 
 // Active sessions keyed by thread ID
-const activeSessions = new Map<string, TmuxCLISession>();
+const activeSessions = new Map<string, CLISession>();
 
 const SESSION_PREFIX = 'dcb-';
 
@@ -62,39 +63,50 @@ export async function startSession(params: StartSessionParams): Promise<void> {
     return;
   }
 
-  // Check if there's an orphaned tmux session (e.g. bot restarted)
-  const tmuxName = sessionName(threadId);
-  const tmuxExists = await tmuxSessionExists(tmuxName);
-
-  logger.log(`Starting ${cliType} session for thread ${threadId} (tmux exists: ${tmuxExists})`);
+  logger.log(`Starting ${cliType} session for thread ${threadId}`);
 
   try {
-    const session = new TmuxCLISession(threadId, cliType, {
-      prompt,
-      workingDirectory,
-      model,
-      effort,
-      maxBudgetUsd,
-    });
+    let session: CLISession;
 
-    // Wire up callbacks before start (so we don't miss events)
-    session.onOutput(onOutput);
-    session.onComplete((result) => {
-      updateSessionStatus(threadId, 'idle');
-      onComplete(result);
-    });
-    session.onError((error) => {
-      updateSessionStatus(threadId, 'error');
-      onError(error);
-    });
-
-    if (tmuxExists) {
-      // Reconnect and send the prompt
-      await session.reconnect();
-      await session.send(prompt);
+    if (cliType === 'codex') {
+      // Codex: use app-server (JSON-RPC, proper streaming, no TUI parsing)
+      const codexSession = new CodexAppServerSession({ prompt, workingDirectory, model, effort, maxBudgetUsd });
+      codexSession.onOutput(onOutput);
+      codexSession.onComplete((result) => {
+        updateSessionStatus(threadId, 'idle');
+        onComplete(result);
+      });
+      codexSession.onError((error) => {
+        updateSessionStatus(threadId, 'error');
+        onError(error);
+      });
+      await codexSession.start();
+      session = codexSession;
     } else {
-      // Create new tmux session
-      await session.start();
+      // Claude: use tmux (interactive mode with send-keys)
+      const tmuxName = sessionName(threadId);
+      const tmuxExists = await tmuxSessionExists(tmuxName);
+
+      const tmuxSession = new TmuxCLISession(threadId, cliType, {
+        prompt, workingDirectory, model, effort, maxBudgetUsd,
+      });
+      tmuxSession.onOutput(onOutput);
+      tmuxSession.onComplete((result) => {
+        updateSessionStatus(threadId, 'idle');
+        onComplete(result);
+      });
+      tmuxSession.onError((error) => {
+        updateSessionStatus(threadId, 'error');
+        onError(error);
+      });
+
+      if (tmuxExists) {
+        await tmuxSession.reconnect();
+        await tmuxSession.send(prompt);
+      } else {
+        await tmuxSession.start();
+      }
+      session = tmuxSession;
     }
 
     activeSessions.set(threadId, session);

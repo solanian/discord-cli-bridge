@@ -201,6 +201,7 @@ export class TmuxCLISession implements CLISession {
   private emittedContent = '';
   private waitingForResponse = false;
   private parser: typeof claudeParser | typeof codexParser;
+  private lastSentMessage = '';  // Track what we sent to match user prompt lines
 
   constructor(
     private threadId: string,
@@ -288,6 +289,7 @@ export class TmuxCLISession implements CLISession {
     this.stableCount = 0;
     this.startTime = Date.now();
     this.waitingForResponse = true;
+    this.lastSentMessage = text.trim();
 
     await tmuxSendKeys(this.name, text);
 
@@ -325,7 +327,7 @@ export class TmuxCLISession implements CLISession {
         if (this.waitingForResponse && this.stableCount >= STABLE_COMPLETE) {
           if (this.parser.isIdlePrompt(capture.split('\n'))) {
             // Only finish if there's actually a response to show
-            const response = this.parser.extractResponse(capture);
+            const response = this.extractResponseForSentMessage(capture);
             if (response) {
               this.finishResponse(capture);
               return;
@@ -352,8 +354,44 @@ export class TmuxCLISession implements CLISession {
     }
   }
 
+  /**
+   * Find response for the message we sent (not placeholder hints).
+   * Searches for our lastSentMessage in the capture, then collects response after it.
+   */
+  private extractResponseForSentMessage(capture: string): string {
+    if (!this.lastSentMessage) return this.parser.extractResponse(capture);
+
+    const lines = capture.split('\n');
+    const promptChar = this.cliType === 'claude' ? '❯' : '›';
+
+    // Find the line containing our sent message
+    let promptIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const t = lines[i]!.trim();
+      // Match "❯ our message" or "› our message"
+      if (t.startsWith(promptChar + ' ') && t.includes(this.lastSentMessage.slice(0, 30))) {
+        promptIdx = i;
+        break;
+      }
+    }
+
+    if (promptIdx === -1) return '';
+
+    // Collect response lines after our prompt
+    const out: string[] = [];
+    for (let i = promptIdx + 1; i < lines.length; i++) {
+      const t = lines[i]!.trim();
+      if (!t) continue;
+      // Stop at next prompt (ours or placeholder)
+      if (t.startsWith(promptChar)) break;
+      if (this.parser.isChrome(t)) continue;
+      out.push(t);
+    }
+    return out.join('\n').trim();
+  }
+
   private extractNewContent(capture: string): string {
-    const response = this.parser.extractResponse(capture);
+    const response = this.extractResponseForSentMessage(capture);
     if (!response) return '';
     if (response === this.emittedContent) return '';
 

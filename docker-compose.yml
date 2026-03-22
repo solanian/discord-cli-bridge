@@ -11,24 +11,35 @@ services:
     volumes:
       - claude-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
-      # Claude CLI auth + config → node user home (UID 1000)
       - ${CLAUDE_CONFIG_DIR:-~/.claude}:/home/node/.claude
       - ${CLAUDE_JSON:-~/.claude.json}:/home/node/.claude.json
+
+  codex-appserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.codex-appserver
+    container_name: codex-appserver
+    restart: unless-stopped
+    volumes:
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
+    expose:
+      - "9876"
 
   codex-bot:
     build: .
     container_name: discord-codex-bot
     restart: unless-stopped
+    depends_on:
+      - codex-appserver
     environment:
       - DISCORD_BOT_TOKEN=${CODEX_BOT_TOKEN}
       - BOT_CLI_TYPE=codex
       - DATA_DIR=/data
-      - TMUX_TMPDIR=/data/tmux
+      - CODEX_APPSERVER_URL=ws://codex-appserver:9876
     volumes:
       - codex-data:/data
       - ${WORKSPACE_DIR:-./workspace}:/workspace
-      # Codex CLI auth → node user home (UID 1000)
-      - ${CODEX_CONFIG_DIR:-~/.codex}:/home/node/.codex
 
 volumes:
   claude-data:
