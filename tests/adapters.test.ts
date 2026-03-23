@@ -1,32 +1,19 @@
 import { describe, it, expect } from 'vitest';
-import { ClaudeCodeAdapter } from '../src/adapters/claude-code.js';
-import { CodexAdapter } from '../src/adapters/codex.js';
+import { ClaudeAgentAdapter } from '../src/adapters/claude-agent.js';
+import { CodexAppServerAdapter } from '../src/adapters/codex-appserver.js';
 
 describe('adapters', () => {
-  describe('ClaudeCodeAdapter', () => {
+  describe('ClaudeAgentAdapter', () => {
     it('should have correct name', () => {
-      const adapter = new ClaudeCodeAdapter();
+      const adapter = new ClaudeAgentAdapter();
       expect(adapter.name).toBe('claude');
-    });
-
-    it('should detect CLI availability', async () => {
-      const adapter = new ClaudeCodeAdapter();
-      const available = await adapter.isAvailable();
-      // Should be true in this environment since claude is installed
-      expect(typeof available).toBe('boolean');
     });
   });
 
-  describe('CodexAdapter', () => {
+  describe('CodexAppServerAdapter', () => {
     it('should have correct name', () => {
-      const adapter = new CodexAdapter();
+      const adapter = new CodexAppServerAdapter();
       expect(adapter.name).toBe('codex');
-    });
-
-    it('should detect CLI availability', async () => {
-      const adapter = new CodexAdapter();
-      const available = await adapter.isAvailable();
-      expect(typeof available).toBe('boolean');
     });
   });
 });
