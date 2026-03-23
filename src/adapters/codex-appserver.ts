@@ -40,15 +40,27 @@ export class CodexAppServerSession implements CLISession {
       capabilities: {},
     });
 
-    // Start thread
-    const threadResult = await this.rpc('thread/start', {
-      cwd: this.options.workingDirectory,
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-      ...(this.options.model && { model: this.options.model }),
-    });
-    this.threadId = threadResult.thread?.id;
-    logger.log(`Thread started: ${this.threadId}`);
+    // Start or resume thread
+    if (this.options.sessionId) {
+      // Resume existing thread
+      const resumeResult = await this.rpc('thread/resume', {
+        threadId: this.options.sessionId,
+        cwd: this.options.workingDirectory,
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+      });
+      this.threadId = this.options.sessionId;
+      logger.log(`Thread resumed: ${this.threadId}`);
+    } else {
+      const threadResult = await this.rpc('thread/start', {
+        cwd: this.options.workingDirectory,
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        ...(this.options.model && { model: this.options.model }),
+      });
+      this.threadId = threadResult.thread?.id;
+      logger.log(`Thread started: ${this.threadId}`);
+    }
 
     if (this.options.prompt) {
       await this.sendTurn(this.options.prompt);

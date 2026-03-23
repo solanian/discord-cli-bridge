@@ -42,9 +42,12 @@ wss.on('connection', (ws) => {
         case 'session/start': {
           const { cwd, prompt, model, effort, sessionId: resumeId } = params || {};
 
+          console.log(`[session/start] cwd=${cwd} resume=${resumeId || 'new'} prompt="${(prompt || '').slice(0, 60)}"`);
+
           const options = {
             maxTurns: 50,
             permissionMode: 'bypassPermissions',
+            cwd: cwd || '/workspace',
             ...(model && { model }),
             ...(effort && { effortLevel: effort }),
             ...(resumeId && { resume: resumeId }),
@@ -63,7 +66,6 @@ wss.on('connection', (ws) => {
             for await (const event of query({
               prompt: prompt || '',
               options,
-              cwd: cwd || process.cwd(),
             })) {
               if (ws.readyState !== WebSocket.OPEN) break;
 
@@ -99,19 +101,30 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'result': {
-                  // Prefer session_id from result event
                   const finalSessionId = event.session_id || sessionId;
                   if (finalSessionId) sessions.set(threadId, finalSessionId);
-                  ws.send(JSON.stringify({
-                    method: 'session/completed',
-                    params: {
-                      threadId,
-                      sessionId: finalSessionId,
-                      result: event.result,
-                      durationMs: event.duration_ms,
-                      cost: event.total_cost_usd,
-                    },
-                  }));
+
+                  if (event.is_error) {
+                    ws.send(JSON.stringify({
+                      method: 'session/error',
+                      params: {
+                        threadId,
+                        sessionId: finalSessionId,
+                        error: event.result || 'Unknown error',
+                      },
+                    }));
+                  } else {
+                    ws.send(JSON.stringify({
+                      method: 'session/completed',
+                      params: {
+                        threadId,
+                        sessionId: finalSessionId,
+                        result: event.result,
+                        durationMs: event.duration_ms,
+                        cost: event.total_cost_usd,
+                      },
+                    }));
+                  }
                   break;
                 }
               }

@@ -39,6 +39,7 @@ export async function startSession(params: StartSessionParams): Promise<void> {
     prompt,
     cliType,
     workingDirectory,
+    sessionId,
     model,
     effort,
     maxBudgetUsd,
@@ -68,10 +69,14 @@ export async function startSession(params: StartSessionParams): Promise<void> {
     let session: CLISession;
 
     if (cliType === 'codex') {
-      // Codex: use app-server (JSON-RPC, proper streaming, no TUI parsing)
-      const codexSession = new CodexAppServerSession({ prompt, workingDirectory, model, effort, maxBudgetUsd });
+      const codexSession = new CodexAppServerSession({
+        prompt, workingDirectory, model, effort, maxBudgetUsd,
+        sessionId,  // pass resume ID if available
+      });
       codexSession.onOutput(onOutput);
       codexSession.onComplete((result) => {
+        // Save session ID for future resume
+        if (result.sessionId) updateSessionCLIId(threadId, result.sessionId);
         updateSessionStatus(threadId, 'idle');
         onComplete(result);
       });
@@ -82,10 +87,14 @@ export async function startSession(params: StartSessionParams): Promise<void> {
       await codexSession.start();
       session = codexSession;
     } else {
-      // Claude: use Agent SDK via WebSocket
-      const claudeSession = new ClaudeAgentSession({ prompt, workingDirectory, model, effort, maxBudgetUsd });
+      const claudeSession = new ClaudeAgentSession({
+        prompt, workingDirectory, model, effort, maxBudgetUsd,
+        sessionId,  // pass resume ID if available
+      });
       claudeSession.onOutput(onOutput);
       claudeSession.onComplete((result) => {
+        // Save session ID for future resume
+        if (result.sessionId) updateSessionCLIId(threadId, result.sessionId);
         updateSessionStatus(threadId, 'idle');
         onComplete(result);
       });
