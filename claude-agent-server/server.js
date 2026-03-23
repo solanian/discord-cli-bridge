@@ -47,6 +47,7 @@ wss.on('connection', (ws) => {
           const options = {
             maxTurns: 50,
             permissionMode: 'bypassPermissions',
+            persistSession: true,
             cwd: cwd || '/workspace',
             ...(model && { model }),
             ...(effort && { effortLevel: effort }),
